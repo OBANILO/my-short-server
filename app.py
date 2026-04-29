@@ -223,10 +223,9 @@ def build_song_title(font, title=""):
     if not title: return ""
     safe_title = ffmpeg_escape(title[:40])
     alpha = "if(lt(t,1),0,if(lt(t,2.5),(t-1)/1.5,0.95))"
-    # Music note + title
     return (
         f"drawtext=fontfile={font}:text='\u266b  {safe_title}  \u266b':"
-        f"fontsize=28:fontcolor=white@1.0:"
+        f"fontsize=26:fontcolor=white@1.0:"
         f"borderw=2:bordercolor=black@0.90:"
         f"shadowcolor=black@0.80:shadowx=2:shadowy=2:"
         f"x=(w-text_w)/2:y=h*0.06:"
@@ -236,7 +235,6 @@ def build_song_title(font, title=""):
 # ─── Subscribe CTA ────────────────────────────────────────────────────────────
 
 def build_subscribe_cta(font):
-    # "Follow for more" text
     follow_alpha = "if(lt(t,1.5),0,if(lt(t,2.5),(t-1.5),0.90))"
     follow = (
         f"drawtext=fontfile={font}:text='Follow for more \U0001f3b5':"
@@ -246,9 +244,7 @@ def build_subscribe_cta(font):
         f"x=(w-text_w)/2:y=h*0.20:"
         f"alpha='{follow_alpha}'"
     )
-    # Animated SUBSCRIBE button
-    btn_alpha  = "if(lt(t,2),0,if(lt(t,3),(t-2),0.88+0.12*abs(sin(2.5*t))))"
-    # Glowing red box behind SUBSCRIBE
+    btn_alpha = "if(lt(t,2),0,if(lt(t,3),(t-2),0.88+0.12*abs(sin(2.5*t))))"
     btn_box = (
         f"drawtext=fontfile={font}:text='  SUBSCRIBE  ':"
         f"fontsize=38:fontcolor=white@1.0:"
@@ -258,7 +254,6 @@ def build_subscribe_cta(font):
         f"x=(w-text_w)/2:y=h*0.26:"
         f"alpha='{btn_alpha}'"
     )
-    # Bouncing arrows
     arr_alpha = "if(lt(t,3),0,0.80+0.20*abs(sin(2.8*t)))"
     arr_y     = "trunc(h*0.34)+trunc(8*abs(sin(2.8*t)))"
     arrows = (
@@ -464,17 +459,14 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
     if title_filter:
         vf_parts.append(title_filter)
 
-    # Lyrics
+    # Karaoke lyrics
     if lyrics_segments:
         karaoke = build_karaoke_filter(lyrics_segments, font, lyrics_font=lyrics_font)
         if karaoke:
             vf_parts.append(karaoke)
 
-    # Subscribe CTA
     vf_parts.append(cta_filter)
-    # EQ bar
     vf_parts.append(eq_filter)
-    # Fade
     vf_parts.append(fade_filter)
 
     return [
@@ -483,6 +475,8 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
         '-i', video_path,
         '-i', audio_path,
         '-vf', ",".join(vf_parts),
+        '-map', '0:v:0',          # ✅ video from pexels
+        '-map', '1:a:0',          # ✅ audio from song
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26',
         '-threads', '1',
         '-c:a', 'aac', '-b:a', '128k',
