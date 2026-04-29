@@ -7,7 +7,6 @@ import threading
 import time
 import re
 import json
-import math
 
 app = Flask(__name__)
 
@@ -17,9 +16,7 @@ AUDIO_SEGMENTS_FOLDER = '/tmp/audio_segments'
 os.makedirs(AUDIO_SEGMENTS_FOLDER, exist_ok=True)
 JOBS_STATE_FILE = '/tmp/jobs_state.json'
 
-LYRICS_Y    = 0.75
-EQ_CENTER_Y = 0.90
-DARK_START  = 0.70
+LYRICS_Y = 0.75
 
 # ─── Job Persistence ──────────────────────────────────────────────────────────
 
@@ -83,200 +80,57 @@ def get_italic_font():
         if os.path.exists(path): return path
     return get_best_font()
 
-# ─── Lyrics Helpers ───────────────────────────────────────────────────────────
+# ─── Download Helpers ─────────────────────────────────────────────────────────
 
-_SECTION_WORDS = r'verse|chorus|bridge|hook|outro|intro|pre[\-\s]?chorus|post[\-\s]?chorus|refrain|interlude|instrumental|spoken|rap|breakdown|solo|ad[\-\s]?lib|vamp|coda|tag|skit|fade'
-SECTION_REGEX = [re.compile(p, re.IGNORECASE) for p in [
-    r'^\[.*\]$', r'^\(.*\)$',
-    rf'^({_SECTION_WORDS})\s*[\d:.\-]*\s*$',
-    rf'^({_SECTION_WORDS})\s*\d*\s*:$',
-    r'^[\d\s\.\)\(\:\-]+$'
-]]
-
-def is_section_label(line):
-    s = line.strip()
-    return any(p.match(s) or p.match(s.rstrip(':').strip()) for p in SECTION_REGEX)
-
-def split_lyrics_lines(text):
-    if not text: return []
-    return [l.strip() for l in text.replace('\r\n','\n').replace('\r','\n').split('\n')
-            if l.strip() and not is_section_label(l.strip())]
-
-def normalize_word(w):
-    return re.sub(r"[^\w']", "", (w or "").lower()).strip()
-
-def transcribe_audio_words_with_whisper(audio_path, openai_api_key):
-    if not openai_api_key or not os.path.exists(audio_path): return []
+def download_file(url, dest_path):
     try:
-        with open(audio_path, "rb") as audio_file:
-            response = requests.post(
-                "https://api.openai.com/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {openai_api_key}"},
-                files={"file": audio_file},
-                data={"model": "whisper-1", "response_format": "verbose_json",
-                      "timestamp_granularities[]": "word"},
-                timeout=300
-            )
-        if response.status_code != 200: return []
-        data = response.json()
-        cleaned = []
-        for w in data.get("words", []):
-            word_text = (w.get("word") or "").strip()
-            start = w.get("start"); end = w.get("end")
-            if not word_text or start is None or end is None: continue
-            start, end = float(start), float(end)
-            if end <= start: continue
-            cleaned.append({"word": word_text, "norm": normalize_word(word_text), "start": start, "end": end})
-        if cleaned: return cleaned
-        seg_words = []
-        for seg in data.get("segments", []):
-            text = (seg.get("text") or "").strip()
-            start = seg.get("start"); end = seg.get("end")
-            if not text or start is None or end is None: continue
-            seg_words.append({"word": text, "norm": normalize_word(text), "start": float(start), "end": float(end)})
-        return seg_words
+        r = requests.get(url, timeout=180, stream=True)
+        r.raise_for_status()
+        with open(dest_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return dest_path
     except Exception as e:
-        print(f"[Whisper] Error: {e}"); return []
+        raise Exception(f"Download failed: {e}")
 
-def build_lines_from_words(words, max_gap=0.45, max_words=6, max_duration=3.0):
-    if not words: return []
-    lines = []; current = [words[0]]
-    def flush(lw):
-        if not lw: return None
-        text = " ".join(w["word"] for w in lw).strip()
-        return {"start": round(lw[0]["start"], 2), "end": round(lw[-1]["end"], 2), "text": text} if text else None
-    for w in words[1:]:
-        prev = current[-1]
-        if (w["start"] - prev["end"] > max_gap or len(current) >= max_words
-                or w["end"] - current[0]["start"] > max_duration):
-            item = flush(current)
-            if item: lines.append(item)
-            current = [w]
-        else:
-            current.append(w)
-    item = flush(current)
-    if item: lines.append(item)
-    cleaned = []
-    for seg in lines:
-        start = float(seg["start"]); end = float(seg["end"]); text = seg["text"].strip()
-        if not text: continue
-        min_dur = max(0.60, min(1.40, len(text.split()) * 0.22))
-        if end - start < min_dur: end = start + min_dur
-        if cleaned and start < cleaned[-1]["end"]:
-            start = round(cleaned[-1]["end"] + 0.03, 2)
-            end = max(end, start + min_dur)
-        cleaned.append({"start": round(start, 2), "end": round(end, 2), "text": text})
-    return cleaned
-
-def transcribe_lyrics_with_whisper(audio_path, openai_api_key, lyrics_text=""):
-    return build_lines_from_words(transcribe_audio_words_with_whisper(audio_path, openai_api_key))
-
-# ─── FFmpeg Escape ────────────────────────────────────────────────────────────
-
-def ffmpeg_escape(text):
-    text = text.replace('\\', '\\\\')
-    text = text.replace("'", "\u2019")
-    text = text.replace(':', '\\:')
-    text = text.replace('%', '\\%')
-    text = text.replace('[', '\\[')
-    text = text.replace(']', '\\]')
-    text = text.replace(',', '\\,')
-    return text
-
-# ─── Watermark ────────────────────────────────────────────────────────────────
-
-def build_artist_watermark(font_italic, artist_name="SORLUNE"):
-    name = ffmpeg_escape(artist_name.upper())
-    padding = 28
-    alpha = "0.875+0.125*sin(6.2832/4.0*t)"
-    watermark = (
-        f"drawtext=fontfile={font_italic}:text='{name}':"
-        f"fontsize=34:fontcolor=0xD4AF37@1.0:"
-        f"borderw=2:bordercolor=black@0.80:"
-        f"shadowcolor=black@0.70:shadowx=2:shadowy=2:"
-        f"x=w-text_w-{padding}:y={padding}:alpha='{alpha}'"
-    )
-    underline = (
-        f"drawtext=fontfile={font_italic}:text='\u2014\u2014\u2014\u2014\u2014\u2014\u2014':"
-        f"fontsize=14:fontcolor=0xD4AF37@1.0:"
-        f"x=w-text_w-{padding}:y={padding+42}:alpha='{alpha}'"
-    )
-    return ",".join([watermark, underline])
-
-# ─── Karaoke Filter ───────────────────────────────────────────────────────────
-
-def wrap_lyric_line(text, max_chars=32):
-    if len(text) <= max_chars: return [text]
-    words = text.split()
-    best_split, best_diff = len(words) // 2, float('inf')
-    for i in range(1, len(words)):
-        p1, p2 = " ".join(words[:i]), " ".join(words[i:])
-        diff = abs(len(p1) - len(p2))
-        if diff < best_diff and len(p1) <= max_chars and len(p2) <= max_chars:
-            best_diff, best_split = diff, i
-    return [" ".join(words[:best_split]), " ".join(words[best_split:])]
-
-def build_karaoke_filter(segments, font, lyrics_font=None):
-    if lyrics_font is None: lyrics_font = font
-    if not segments: return ""
-    parts = []; FONT_SIZE = 42; LINE_HEIGHT = 52; MAX_CHARS = 32
-    for seg in segments:
-        start, end, raw_text = seg["start"], seg["end"], seg["text"]
-        dur = max(end - start, 0.5)
-        fade_dur = min(0.18, dur / 5)
-        alpha_expr = (
-            f"if(between(t,{start},{start+fade_dur}),(t-{start})/{fade_dur},"
-            f"if(between(t,{start+fade_dur},{end-fade_dur}),1,"
-            f"if(between(t,{end-fade_dur},{end}),({end}-t)/{fade_dur},0)))"
+def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
+    if '.mp4' in pexels_url.lower() or 'videos/download' in pexels_url:
+        return download_file(pexels_url, dest_path)
+    if 'pexels.com' not in pexels_url:
+        return download_file(pexels_url, dest_path)
+    match = re.search(r'/video/[^/]+-(\d+)/?', pexels_url)
+    if not match:
+        match = re.search(r'(\d{5,})/?$', pexels_url)
+    if not match:
+        return download_file(pexels_url, dest_path)
+    video_id = match.group(1)
+    api_key_to_use = pexels_api_key or 'xC87vhy3Cf152ByhxRtakfR4mM2rRHN2NxGIlVqzUHQQ5VlB5ebYoCva'
+    try:
+        api_resp = requests.get(
+            f"https://api.pexels.com/videos/videos/{video_id}",
+            headers={"Authorization": api_key_to_use},
+            timeout=30
         )
-        lines = wrap_lyric_line(raw_text, max_chars=MAX_CHARS)
-        if len(lines) == 1:
-            parts.append(
-                f"drawtext=fontfile={lyrics_font}:text='{ffmpeg_escape(lines[0])}':"
-                f"fontsize={FONT_SIZE}:fontcolor=white@1.0:"
-                f"borderw=4:bordercolor=black@1.0:"
-                f"shadowcolor=black@0.95:shadowx=3:shadowy=3:"
-                f"x=(w-text_w)/2:y=h*{LYRICS_Y}:alpha='{alpha_expr}'"
-            )
-        else:
-            base_y = LYRICS_Y - 0.05
-            for li, line in enumerate(lines):
-                parts.append(
-                    f"drawtext=fontfile={lyrics_font}:text='{ffmpeg_escape(line)}':"
-                    f"fontsize={FONT_SIZE}:fontcolor=white@1.0:"
-                    f"borderw=4:bordercolor=black@1.0:"
-                    f"shadowcolor=black@0.95:shadowx=3:shadowy=3:"
-                    f"x=(w-text_w)/2:y=h*{base_y}+{li*LINE_HEIGHT}:alpha='{alpha_expr}'"
-                )
-    return ",".join(parts)
-
-# ─── EQ Bar ───────────────────────────────────────────────────────────────────
-
-def build_eq_bar(font):
-    parts = []; bar_count = 24; bar_gap = 12; half = bar_count // 2
-    center_y = f"h*{EQ_CENTER_Y}"
-    freqs  = [1.3,2.1,2.7,1.9,3.1,2.4,1.7,2.9,2.2,3.5,2.0,2.8,2.1,2.8,2.0,3.5,2.2,2.9,1.7,2.4,3.1,1.9,2.7,2.1]
-    phases = [0.0,0.5,1.1,1.7,0.3,0.9,1.5,0.2,0.8,1.4,0.6,1.2,0.0,1.2,0.6,1.4,0.8,0.2,1.5,0.9,0.3,1.7,1.1,0.5]
-    for i in range(bar_count):
-        dist = abs(i - half) / half
-        amplitude = int(5 + 30 * math.exp(-2.5 * dist * dist))
-        alpha_up  = 0.90 - 0.25 * dist
-        alpha_dwn = 0.40 - 0.15 * dist
-        offset = (i - half) * bar_gap
-        bar_x  = f"(w/2+({offset})-tw/2)"
-        fs_expr = f"4+{amplitude}*abs(sin(t*{freqs[i]}+{phases[i]}))"
-        parts.append(f"drawtext=fontfile={font}:text='|':fontsize={fs_expr}:fontcolor=0xD4AF37@{alpha_up:.2f}:x={bar_x}:y=({center_y})-text_h")
-        parts.append(f"drawtext=fontfile={font}:text='|':fontsize={fs_expr}:fontcolor=0xB8860B@{alpha_dwn:.2f}:x={bar_x}:y={center_y}")
-    return ",".join(parts)
-
-# ─── Dark Overlay ─────────────────────────────────────────────────────────────
-
-def build_dark_overlay(font):
-    return (
-        f"drawtext=fontfile={font}:text=' ':fontsize=1:fontcolor=black@0:"
-        f"box=1:boxcolor=black@0.50:boxborderw=0:"
-        f"x=0:y=h*{DARK_START}:fix_bounds=1"
-    )
+        if api_resp.status_code == 200:
+            data = api_resp.json()
+            files = data.get('video_files', [])
+            selected = None; max_h = 0
+            for f in files:
+                h = f.get('height', 0)
+                if h <= 720 and h > max_h:
+                    max_h = h; selected = f['link']
+            if not selected:
+                for f in files:
+                    if f.get('quality') == 'sd':
+                        selected = f['link']; break
+            if not selected and files:
+                selected = files[0]['link']
+            if selected:
+                print(f"[Pexels] {selected[:80]}")
+                return download_file(selected, dest_path)
+    except Exception as e:
+        print(f"[Pexels API] Error: {e}")
+    return download_file(f"https://www.pexels.com/video/{video_id}/download/", dest_path)
 
 # ─── Video / Audio Info ───────────────────────────────────────────────────────
 
@@ -306,16 +160,16 @@ def get_video_info(video_path):
                 try: duration = float(v)
                 except: pass
     if duration is None:
-        result2 = subprocess.run(
+        r2 = subprocess.run(
             ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
              '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
             capture_output=True, text=True
         )
-        v2 = result2.stdout.strip()
+        v2 = r2.stdout.strip()
         if v2 and v2 != 'N/A':
             try: duration = float(v2)
             except: pass
-    print(f"[VideoInfo] duration={duration} width={width} height={height}")
+    print(f"[VideoInfo] dur={duration} w={width} h={height}")
     return duration or 30.0, width or 1080, height or 1920
 
 def get_audio_duration(audio_path):
@@ -330,6 +184,167 @@ def get_audio_duration(audio_path):
         except: pass
     return 45.0
 
+# ─── Lyrics Helpers ───────────────────────────────────────────────────────────
+
+_SECTION_WORDS = r'verse|chorus|bridge|hook|outro|intro|pre[\-\s]?chorus|post[\-\s]?chorus|refrain|interlude|instrumental|spoken|rap|breakdown|solo'
+SECTION_REGEX = [re.compile(p, re.IGNORECASE) for p in [
+    r'^\[.*\]$', r'^\(.*\)$',
+    rf'^({_SECTION_WORDS})\s*[\d:.\-]*\s*$',
+    r'^[\d\s\.\)\(\:\-]+$'
+]]
+
+def is_section_label(line):
+    s = line.strip()
+    return any(p.match(s) for p in SECTION_REGEX)
+
+def split_lyrics_lines(text):
+    if not text: return []
+    return [l.strip() for l in text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+            if l.strip() and not is_section_label(l.strip())]
+
+def normalize_word(w):
+    return re.sub(r"[^\w']", "", (w or "").lower()).strip()
+
+def transcribe_audio_words_with_whisper(audio_path, openai_api_key):
+    if not openai_api_key or not os.path.exists(audio_path): return []
+    try:
+        with open(audio_path, "rb") as audio_file:
+            response = requests.post(
+                "https://api.openai.com/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {openai_api_key}"},
+                files={"file": audio_file},
+                data={"model": "whisper-1", "response_format": "verbose_json",
+                      "timestamp_granularities[]": "word"},
+                timeout=300
+            )
+        if response.status_code != 200: return []
+        data = response.json()
+        cleaned = []
+        for w in data.get("words", []):
+            word_text = (w.get("word") or "").strip()
+            start = w.get("start"); end = w.get("end")
+            if not word_text or start is None or end is None: continue
+            start, end = float(start), float(end)
+            if end <= start: continue
+            cleaned.append({"word": word_text, "start": start, "end": end})
+        if cleaned: return cleaned
+        seg_words = []
+        for seg in data.get("segments", []):
+            text = (seg.get("text") or "").strip()
+            start = seg.get("start"); end = seg.get("end")
+            if not text or start is None or end is None: continue
+            seg_words.append({"word": text, "start": float(start), "end": float(end)})
+        return seg_words
+    except Exception as e:
+        print(f"[Whisper] Error: {e}"); return []
+
+def build_lines_from_words(words, max_gap=0.45, max_words=5, max_duration=3.0):
+    if not words: return []
+    lines = []; current = [words[0]]
+    def flush(lw):
+        if not lw: return None
+        text = " ".join(w["word"] for w in lw).strip()
+        return {"start": round(lw[0]["start"], 2), "end": round(lw[-1]["end"], 2), "text": text} if text else None
+    for w in words[1:]:
+        prev = current[-1]
+        if (w["start"] - prev["end"] > max_gap or len(current) >= max_words
+                or w["end"] - current[0]["start"] > max_duration):
+            item = flush(current)
+            if item: lines.append(item)
+            current = [w]
+        else:
+            current.append(w)
+    item = flush(current)
+    if item: lines.append(item)
+    cleaned = []
+    for seg in lines:
+        start = float(seg["start"]); end = float(seg["end"]); text = seg["text"].strip()
+        if not text: continue
+        min_dur = max(0.60, min(1.40, len(text.split()) * 0.22))
+        if end - start < min_dur: end = start + min_dur
+        if cleaned and start < cleaned[-1]["end"]:
+            start = round(cleaned[-1]["end"] + 0.03, 2)
+            end = max(end, start + min_dur)
+        cleaned.append({"start": round(start, 2), "end": round(end, 2), "text": text})
+    return cleaned
+
+def transcribe_lyrics_with_whisper(audio_path, openai_api_key):
+    return build_lines_from_words(transcribe_audio_words_with_whisper(audio_path, openai_api_key))
+
+# ─── FFmpeg Escape ────────────────────────────────────────────────────────────
+
+def ffmpeg_escape(text):
+    text = text.replace('\\', '\\\\')
+    text = text.replace("'", "\u2019")
+    text = text.replace(':', '\\:')
+    text = text.replace('%', '\\%')
+    text = text.replace('[', '\\[')
+    text = text.replace(']', '\\]')
+    text = text.replace(',', '\\,')
+    return text
+
+# ─── Watermark ────────────────────────────────────────────────────────────────
+
+def build_artist_watermark(font_italic, artist_name="SORLUNE"):
+    name = ffmpeg_escape(artist_name.upper())
+    padding = 24
+    alpha = "0.875+0.125*sin(6.2832/4.0*t)"
+    return (
+        f"drawtext=fontfile={font_italic}:text='{name}':"
+        f"fontsize=30:fontcolor=0xD4AF37@1.0:"
+        f"borderw=2:bordercolor=black@0.80:"
+        f"shadowcolor=black@0.70:shadowx=2:shadowy=2:"
+        f"x=w-text_w-{padding}:y={padding}:alpha='{alpha}'"
+    )
+
+# ─── Karaoke Filter ───────────────────────────────────────────────────────────
+
+def wrap_lyric_line(text, max_chars=28):
+    if len(text) <= max_chars: return [text]
+    words = text.split()
+    best_split, best_diff = len(words) // 2, float('inf')
+    for i in range(1, len(words)):
+        p1, p2 = " ".join(words[:i]), " ".join(words[i:])
+        diff = abs(len(p1) - len(p2))
+        if diff < best_diff and len(p1) <= max_chars and len(p2) <= max_chars:
+            best_diff, best_split = diff, i
+    return [" ".join(words[:best_split]), " ".join(words[best_split:])]
+
+def build_karaoke_filter(segments, lyrics_font):
+    if not segments: return ""
+    parts = []
+    FONT_SIZE = 40
+    LINE_HEIGHT = 50
+    for seg in segments:
+        start, end, raw_text = seg["start"], seg["end"], seg["text"]
+        dur = max(end - start, 0.5)
+        fade_dur = min(0.15, dur / 5)
+        alpha_expr = (
+            f"if(between(t,{start},{start+fade_dur}),(t-{start})/{fade_dur},"
+            f"if(between(t,{start+fade_dur},{end-fade_dur}),1,"
+            f"if(between(t,{end-fade_dur},{end}),({end}-t)/{fade_dur},0)))"
+        )
+        lines = wrap_lyric_line(raw_text)
+        if len(lines) == 1:
+            parts.append(
+                f"drawtext=fontfile={lyrics_font}:text='{ffmpeg_escape(lines[0])}':"
+                f"fontsize={FONT_SIZE}:fontcolor=white@1.0:"
+                f"borderw=3:bordercolor=black@1.0:"
+                f"shadowcolor=black@0.90:shadowx=2:shadowy=2:"
+                f"x=(w-text_w)/2:y=h*{LYRICS_Y}:alpha='{alpha_expr}'"
+            )
+        else:
+            base_y = LYRICS_Y - 0.04
+            for li, line in enumerate(lines):
+                parts.append(
+                    f"drawtext=fontfile={lyrics_font}:text='{ffmpeg_escape(line)}':"
+                    f"fontsize={FONT_SIZE}:fontcolor=white@1.0:"
+                    f"borderw=3:bordercolor=black@1.0:"
+                    f"shadowcolor=black@0.90:shadowx=2:shadowy=2:"
+                    f"x=(w-text_w)/2:y=h*{base_y}+{li*LINE_HEIGHT}:alpha='{alpha_expr}'"
+                )
+    return ",".join(parts)
+
 # ─── Core: Build Short Video ──────────────────────────────────────────────────
 
 def build_short_video(video_path, audio_path, output_path,
@@ -337,48 +352,41 @@ def build_short_video(video_path, audio_path, output_path,
                       lyrics_segments=None):
 
     aud_duration = get_audio_duration(audio_path)
-
-    # Audio is master — video just loops as background
     final_duration = min(aud_duration, float(short_duration))
     print(f"[Build] aud={aud_duration}s final={final_duration}s")
 
     font        = get_best_font()
     font_italic = get_italic_font()
     lyrics_font = get_lyrics_font()
-
     fade_out_st = max(final_duration - 2.0, final_duration * 0.90)
 
-    # Scale + crop to 9:16 vertical (1080x1920)
+    # 1. Scale + crop to 9:16 vertical
     scale_crop = (
         "scale=iw*max(1080/iw\\,1920/ih):ih*max(1080/iw\\,1920/ih),"
         "crop=1080:1920"
     )
-    # Color grade
-    grade = (
-        "eq=brightness=0.02:contrast=1.05:saturation=1.10,"
-        "curves=r='0/0 0.5/0.52 1/1':g='0/0 0.5/0.49 1/0.96':b='0/0 0.5/0.44 1/0.88',"
-        "vignette=PI/5"
-    )
-    fade      = f"fade=t=in:st=0:d=1.5,fade=t=out:st={fade_out_st:.2f}:d=2"
-    pix       = "format=yuv420p"
-    dark      = build_dark_overlay(font)
+    # 2. Color grade
+    grade = "eq=brightness=0.02:contrast=1.05:saturation=1.10"
+    # 3. Fade
+    fade = f"fade=t=in:st=0:d=1.5,fade=t=out:st={fade_out_st:.2f}:d=2"
+    # 4. Format
+    pix = "format=yuv420p"
+    # 5. Watermark
     watermark = build_artist_watermark(font_italic, artist_name)
-    eq        = build_eq_bar(font)
 
-    vf_parts = [scale_crop, grade, fade, pix, dark, watermark]
+    vf_parts = [scale_crop, grade, fade, pix, watermark]
 
-    # Add karaoke if lyrics available
+    # 6. Karaoke lyrics
     if lyrics_segments:
-        karaoke = build_karaoke_filter(lyrics_segments, font, lyrics_font)
+        karaoke = build_karaoke_filter(lyrics_segments, lyrics_font)
         if karaoke:
             vf_parts.append(karaoke)
 
-    vf_parts.append(eq)
     vf = ",".join(vf_parts)
 
     cmd = [
         'ffmpeg', '-y',
-        '-stream_loop', '-1',    # ✅ loop video as background
+        '-stream_loop', '-1',     # loop video background
         '-i', video_path,
         '-i', audio_path,
         '-vf', vf,
@@ -386,12 +394,11 @@ def build_short_video(video_path, audio_path, output_path,
         '-map', '1:a:0',
         '-c:v', 'libx264',
         '-preset', 'ultrafast',
-        '-crf', '28',
+        '-crf', '30',
         '-c:a', 'aac',
         '-b:a', '128k',
         '-pix_fmt', 'yuv420p',
-        '-t', str(final_duration),  # ✅ duration = audio length
-        '-shortest',
+        '-t', str(final_duration),
         '-threads', '1',
         output_path
     ]
@@ -475,11 +482,10 @@ def generate_short():
             if openai_key:
                 try:
                     save_job(job_id, {'status': 'transcribing_lyrics'})
-                    lyrics_segments = transcribe_lyrics_with_whisper(audio_path, openai_key, lyrics_text)
+                    lyrics_segments = transcribe_lyrics_with_whisper(audio_path, openai_key)
                     print(f"[Job {job_id}] Lyrics: {len(lyrics_segments)} segments")
                 except Exception as e:
                     print(f"[Lyrics] Whisper failed: {e}")
-                    lyrics_segments = []
 
             # Fallback: time-based lyrics
             if not lyrics_segments and lyrics_text:
@@ -564,8 +570,7 @@ def process_audio():
         return jsonify({'error': f'Download failed: {str(e)}'}), 500
 
     total_duration = get_audio_duration(audio_path)
-    segments = []
-    start = 0; idx = 0
+    segments = []; start = 0; idx = 0
     while start < total_duration:
         seg_fn   = f'{session_id}_seg{idx:03d}.mp3'
         seg_path = os.path.join(AUDIO_SEGMENTS_FOLDER, seg_fn)
@@ -591,56 +596,6 @@ def serve_audio_segment(filename):
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok', 'message': 'My Short server running'}), 200
-
-
-def download_file(url, dest_path):
-    try:
-        r = requests.get(url, timeout=180, stream=True)
-        r.raise_for_status()
-        with open(dest_path, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                f.write(chunk)
-        return dest_path
-    except Exception as e:
-        raise Exception(f"Download failed: {e}")
-
-def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
-    if '.mp4' in pexels_url.lower() or 'videos/download' in pexels_url:
-        return download_file(pexels_url, dest_path)
-    if 'pexels.com' not in pexels_url:
-        return download_file(pexels_url, dest_path)
-    match = re.search(r'/video/[^/]+-(\d+)/?', pexels_url)
-    if not match:
-        match = re.search(r'(\d{5,})/?$', pexels_url)
-    if not match:
-        return download_file(pexels_url, dest_path)
-    video_id = match.group(1)
-    api_key_to_use = pexels_api_key or 'xC87vhy3Cf152ByhxRtakfR4mM2rRHN2NxGIlVqzUHQQ5VlB5ebYoCva'
-    try:
-        api_resp = requests.get(
-            f"https://api.pexels.com/videos/videos/{video_id}",
-            headers={"Authorization": api_key_to_use},
-            timeout=30
-        )
-        if api_resp.status_code == 200:
-            data = api_resp.json()
-            files = data.get('video_files', [])
-            selected = None; max_h = 0
-            for f in files:
-                h = f.get('height', 0)
-                if h <= 720 and h > max_h:
-                    max_h = h; selected = f['link']
-            if not selected:
-                for f in files:
-                    if f.get('quality') == 'sd':
-                        selected = f['link']; break
-            if not selected and files:
-                selected = files[0]['link']
-            if selected:
-                return download_file(selected, dest_path)
-    except Exception as e:
-        print(f"[Pexels API] Error: {e}")
-    return download_file(f"https://www.pexels.com/video/{video_id}/download/", dest_path)
 
 
 if __name__ == '__main__':
