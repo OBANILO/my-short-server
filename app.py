@@ -75,22 +75,17 @@ def download_file(url, dest_path):
     return dest_path
 
 def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
-    # Already a direct video link
     if '.mp4' in pexels_url.lower() or 'videos/download' in pexels_url:
         return download_file(pexels_url, dest_path)
     if 'pexels.com' not in pexels_url:
         return download_file(pexels_url, dest_path)
-
-    # Extract video ID
     match = re.search(r'/video/[^/]+-(\d+)/?', pexels_url)
     if not match:
         match = re.search(r'(\d{5,})/?$', pexels_url)
     if not match:
         return download_file(pexels_url, dest_path)
-
     video_id = match.group(1)
     api_key_to_use = pexels_api_key or 'xC87vhy3Cf152ByhxRtakfR4mM2rRHN2NxGIlVqzUHQQ5VlB5ebYoCva'
-
     try:
         api_resp = requests.get(
             f"https://api.pexels.com/videos/videos/{video_id}",
@@ -100,18 +95,15 @@ def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
         if api_resp.status_code == 200:
             data = api_resp.json()
             files = data.get('video_files', [])
-            selected = None
-            max_h = 0
+            selected = None; max_h = 0
             for f in files:
                 h = f.get('height', 0)
                 if h <= 720 and h > max_h:
-                    max_h = h
-                    selected = f['link']
+                    max_h = h; selected = f['link']
             if not selected:
                 for f in files:
                     if f.get('quality') == 'sd':
-                        selected = f['link']
-                        break
+                        selected = f['link']; break
             if not selected and files:
                 selected = files[0]['link']
             if selected:
@@ -119,7 +111,6 @@ def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
                 return download_file(selected, dest_path)
     except Exception as e:
         print(f"[Pexels API] Error: {e}")
-
     return download_file(f"https://www.pexels.com/video/{video_id}/download/", dest_path)
 
 # ─── Audio Helpers ────────────────────────────────────────────────────────────
@@ -207,12 +198,10 @@ def build_eq_bar(font):
     bar_gap   = 12
     half      = bar_count // 2
     center_y  = f"h*{EQ_CENTER_Y}"
-
     freqs  = [1.3,2.1,2.7,1.9,3.1,2.4,1.7,2.9,2.2,3.5,2.0,2.8,
               2.8,2.0,3.5,2.2,2.9,1.7,2.4,3.1,1.9,2.7,2.1,1.3]
     phases = [0.0,0.5,1.1,1.7,0.3,0.9,1.5,0.2,0.8,1.4,0.6,1.2,
               1.2,0.6,1.4,0.8,0.2,1.5,0.9,0.3,1.7,1.1,0.5,0.0]
-
     for i in range(bar_count):
         dist      = abs(i - half) / half
         amplitude = int(4 + 28 * math.exp(-2.5 * dist * dist))
@@ -386,15 +375,13 @@ def build_karaoke_filter(segments, font, lyrics_font=None):
                 )
     return ",".join(parts)
 
-# ─── Core FFmpeg Command ──────────────────────────────────────────────────────
+# ─── Core FFmpeg ──────────────────────────────────────────────────────────────
 
 def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_duration,
                                 font, font_italic, lyrics_font=None,
                                 lyrics_segments=None, artist_name="SORLUNE"):
-    fade_out_st = max(audio_duration - 3, audio_duration * 0.85)
-
-    # Scale + crop to 9:16 vertical (720x1280)
-    scale_crop = (
+    fade_out_st  = max(audio_duration - 3, audio_duration * 0.85)
+    scale_crop   = (
         "scale=720:1280:force_original_aspect_ratio=increase,"
         "crop=720:1280"
     )
@@ -425,7 +412,7 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
 
     return [
         'ffmpeg', '-y',
-        '-stream_loop', '-1',    # ✅ loop pexels video as background
+        '-stream_loop', '-1',
         '-i', video_path,
         '-i', audio_path,
         '-vf', ",".join(vf_parts),
@@ -433,7 +420,7 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
         '-threads', '1',
         '-c:a', 'aac', '-b:a', '128k',
         '-pix_fmt', 'yuv420p',
-        '-t', str(audio_duration),  # ✅ audio is master
+        '-t', str(audio_duration),
         '-shortest',
         output_path
     ]
@@ -507,6 +494,8 @@ def generate_short():
     save_job(job_id, {'status': 'pending', 'video_url': None})
 
     def run():
+        # ✅ Define final_audio_path at top so it's always accessible
+        final_audio_path = None
         try:
             for f in [video_path, audio_path, output_path]:
                 if os.path.exists(f): os.remove(f)
@@ -519,31 +508,41 @@ def generate_short():
             download_file(audio_url, audio_path)
             print(f"[Job {job_id}] Audio: {os.path.getsize(audio_path)} bytes")
 
-            # Trim audio to short_duration
-            trimmed_audio = os.path.join(job_folder, 'audio_trimmed.mp3')
-            subprocess.run([
-                'ffmpeg', '-y', '-i', audio_path,
-                '-t', str(short_duration),
-                '-c:a', 'libmp3lame', '-b:a', '128k',
-                trimmed_audio
-            ], capture_output=True, timeout=60)
-            if os.path.exists(trimmed_audio) and os.path.getsize(trimmed_audio) > 1000:
-                audio_path = trimmed_audio
-                print(f"[Job {job_id}] Audio trimmed to {short_duration}s")
+            # ✅ Trim audio to short_duration — always set final_audio_path
+            final_audio_path = audio_path
+            try:
+                trimmed_audio = os.path.join(job_folder, 'audio_trimmed.mp3')
+                proc_trim = subprocess.run([
+                    'ffmpeg', '-y', '-i', audio_path,
+                    '-t', str(short_duration),
+                    '-c:a', 'libmp3lame', '-b:a', '128k',
+                    trimmed_audio
+                ], capture_output=True, timeout=60)
+                if (proc_trim.returncode == 0 and
+                        os.path.exists(trimmed_audio) and
+                        os.path.getsize(trimmed_audio) > 1000):
+                    final_audio_path = trimmed_audio
+                    print(f"[Job {job_id}] Audio trimmed to {short_duration}s")
+                else:
+                    print(f"[Job {job_id}] Trim failed, using full audio")
+            except Exception as trim_err:
+                print(f"[Trim] Failed: {trim_err} — using full audio")
 
-            # Lyrics via Whisper
+            # ✅ Lyrics via Whisper
             lyrics_segments = []
             if openai_key:
                 try:
                     save_job(job_id, {'status': 'transcribing_lyrics'})
-                    lyrics_segments = transcribe_lyrics_with_whisper(audio_path, openai_key, lyrics_text)
+                    lyrics_segments = transcribe_lyrics_with_whisper(
+                        final_audio_path, openai_key, lyrics_text
+                    )
                     print(f"[Job {job_id}] Lyrics: {len(lyrics_segments)} segments")
                 except Exception as e:
                     print(f"[Lyrics] Whisper failed: {e}")
 
-            # Fallback: time-based lyrics
+            # ✅ Fallback: time-based lyrics
             if not lyrics_segments and lyrics_text:
-                duration = get_audio_duration(audio_path)
+                duration = get_audio_duration(final_audio_path)
                 lines    = split_lyrics_lines(lyrics_text)
                 if lines:
                     step = max(duration / len(lines), 1.8)
@@ -557,10 +556,11 @@ def generate_short():
                         current += step
 
             generate_short_job(
-                job_id, video_path, audio_path, output_path,
+                job_id, video_path, final_audio_path, output_path,
                 lyrics_segments=lyrics_segments,
                 artist_name=artist_name
             )
+
         except Exception as e:
             save_job(job_id, {'status': 'error', 'error': str(e)})
             print(f"[Job {job_id}] ❌ {e}")
