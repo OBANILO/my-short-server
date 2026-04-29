@@ -17,7 +17,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(AUDIO_SEGMENTS_FOLDER, exist_ok=True)
 
 EQ_CENTER_Y = 0.92
-DARK_START  = 0.70
+DARK_START  = 0.68
 LYRICS_Y    = 0.80
 
 # ─── Job Persistence ──────────────────────────────────────────────────────────
@@ -126,7 +126,6 @@ def get_audio_duration(audio_path):
     return 45.0
 
 def find_best_segment(audio_path, segment_duration=45):
-    """Find the loudest/most energetic segment in the audio."""
     total_duration = get_audio_duration(audio_path)
     if total_duration <= segment_duration:
         return 0.0
@@ -218,6 +217,59 @@ def build_artist_watermark(font_italic, artist_name="SORLUNE"):
     )
     return ",".join([watermark, underline])
 
+# ─── Song Title ───────────────────────────────────────────────────────────────
+
+def build_song_title(font, title=""):
+    if not title: return ""
+    safe_title = ffmpeg_escape(title[:40])
+    alpha = "if(lt(t,1),0,if(lt(t,2.5),(t-1)/1.5,0.95))"
+    # Music note + title
+    return (
+        f"drawtext=fontfile={font}:text='\u266b  {safe_title}  \u266b':"
+        f"fontsize=28:fontcolor=white@1.0:"
+        f"borderw=2:bordercolor=black@0.90:"
+        f"shadowcolor=black@0.80:shadowx=2:shadowy=2:"
+        f"x=(w-text_w)/2:y=h*0.06:"
+        f"alpha='{alpha}'"
+    )
+
+# ─── Subscribe CTA ────────────────────────────────────────────────────────────
+
+def build_subscribe_cta(font):
+    # "Follow for more" text
+    follow_alpha = "if(lt(t,1.5),0,if(lt(t,2.5),(t-1.5),0.90))"
+    follow = (
+        f"drawtext=fontfile={font}:text='Follow for more \U0001f3b5':"
+        f"fontsize=22:fontcolor=white@1.0:"
+        f"borderw=2:bordercolor=black@0.80:"
+        f"shadowcolor=black@0.70:shadowx=1:shadowy=1:"
+        f"x=(w-text_w)/2:y=h*0.20:"
+        f"alpha='{follow_alpha}'"
+    )
+    # Animated SUBSCRIBE button
+    btn_alpha  = "if(lt(t,2),0,if(lt(t,3),(t-2),0.88+0.12*abs(sin(2.5*t))))"
+    # Glowing red box behind SUBSCRIBE
+    btn_box = (
+        f"drawtext=fontfile={font}:text='  SUBSCRIBE  ':"
+        f"fontsize=38:fontcolor=white@1.0:"
+        f"borderw=0:"
+        f"box=1:boxcolor=0xCC0000@0.92:boxborderw=12:"
+        f"shadowcolor=0xFF0000@0.50:shadowx=0:shadowy=0:"
+        f"x=(w-text_w)/2:y=h*0.26:"
+        f"alpha='{btn_alpha}'"
+    )
+    # Bouncing arrows
+    arr_alpha = "if(lt(t,3),0,0.80+0.20*abs(sin(2.8*t)))"
+    arr_y     = "trunc(h*0.34)+trunc(8*abs(sin(2.8*t)))"
+    arrows = (
+        f"drawtext=fontfile={font}:text='\u25BC   \u25BC   \u25BC':"
+        f"fontsize=22:fontcolor=0xFF3333@1.0:"
+        f"borderw=1:bordercolor=black@0.80:"
+        f"x=(w-text_w)/2:y={arr_y}:"
+        f"alpha='{arr_alpha}'"
+    )
+    return ",".join([follow, btn_box, arrows])
+
 # ─── EQ Bar ───────────────────────────────────────────────────────────────────
 
 def build_eq_bar(font):
@@ -247,29 +299,6 @@ def build_eq_bar(font):
             f"fontcolor=0xB8860B@{alpha_dwn:.2f}:x={bar_x}:y={center_y}"
         )
     return ",".join(parts)
-
-# ─── Subscribe Animation ──────────────────────────────────────────────────────
-
-def build_subscribe_animation(font):
-    alpha     = "if(lt(t,2),0,if(lt(t,3),(t-2),0.85+0.15*abs(sin(3.14159*t))))"
-    arr_alpha = "if(lt(t,3),0,0.7+0.3*abs(sin(2.8*t)))"
-    arr_y     = "trunc(h*0.25)+44+trunc(6*abs(sin(2.8*t)))"
-    sub = (
-        f"drawtext=fontfile={font}:text='SUBSCRIBE':"
-        f"fontsize=40:fontcolor=white@1.0:"
-        f"borderw=3:bordercolor=0xFF1111@1.0:"
-        f"shadowcolor=black@0.9:shadowx=2:shadowy=2:"
-        f"x=(w-text_w)/2:y=trunc(h*0.25)-16:"
-        f"alpha='{alpha}'"
-    )
-    arrow = (
-        f"drawtext=fontfile={font}:text='\u25BC  \u25BC':"
-        f"fontsize=20:fontcolor=0xFF3333@1.0:"
-        f"borderw=1:bordercolor=black@0.8:"
-        f"x=(w-text_w)/2:y={arr_y}:"
-        f"alpha='{arr_alpha}'"
-    )
-    return ",".join([sub, arrow])
 
 # ─── Lyrics ───────────────────────────────────────────────────────────────────
 
@@ -407,7 +436,8 @@ def build_karaoke_filter(segments, font, lyrics_font=None):
 
 def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_duration,
                                 font, font_italic, lyrics_font=None,
-                                lyrics_segments=None, artist_name="SORLUNE"):
+                                lyrics_segments=None, artist_name="SORLUNE",
+                                song_title=""):
     fade_out_st  = max(audio_duration - 3, audio_duration * 0.85)
     scale_crop   = (
         "scale=720:1280:force_original_aspect_ratio=increase,"
@@ -419,23 +449,32 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
     )
     dark_overlay = (
         f"drawtext=fontfile={font}:text=' ':fontsize=1:fontcolor=black@0:"
-        f"box=1:boxcolor=black@0.60:boxborderw=0:"
+        f"box=1:boxcolor=black@0.55:boxborderw=0:"
         f"x=0:y=h*{DARK_START}:fix_bounds=1"
     )
-    fade_filter      = f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
-    artist_filter    = build_artist_watermark(font_italic, artist_name)
-    eq_filter        = build_eq_bar(font)
-    subscribe_filter = build_subscribe_animation(font)
+    fade_filter   = f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
+    artist_filter = build_artist_watermark(font_italic, artist_name)
+    cta_filter    = build_subscribe_cta(font)
+    eq_filter     = build_eq_bar(font)
 
     vf_parts = [scale_crop, grade_filter, "format=yuv420p", dark_overlay, artist_filter]
 
+    # Song title at top
+    title_filter = build_song_title(font, song_title)
+    if title_filter:
+        vf_parts.append(title_filter)
+
+    # Lyrics
     if lyrics_segments:
         karaoke = build_karaoke_filter(lyrics_segments, font, lyrics_font=lyrics_font)
         if karaoke:
             vf_parts.append(karaoke)
 
-    vf_parts.append(subscribe_filter)
+    # Subscribe CTA
+    vf_parts.append(cta_filter)
+    # EQ bar
     vf_parts.append(eq_filter)
+    # Fade
     vf_parts.append(fade_filter)
 
     return [
@@ -454,7 +493,7 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
     ]
 
 def generate_short_job(job_id, video_path, audio_path, output_path,
-                       lyrics_segments=None, artist_name="SORLUNE"):
+                       lyrics_segments=None, artist_name="SORLUNE", song_title=""):
     try:
         save_job(job_id, {'status': 'processing'})
         audio_duration = get_audio_duration(audio_path)
@@ -467,7 +506,8 @@ def generate_short_job(job_id, video_path, audio_path, output_path,
             audio_duration, font, font_italic,
             lyrics_font=lyrics_font,
             lyrics_segments=lyrics_segments,
-            artist_name=artist_name
+            artist_name=artist_name,
+            song_title=song_title
         )
 
         print(f"[FFmpeg] Starting job {job_id}...")
@@ -505,11 +545,12 @@ def generate_short():
     short_duration = int(data.get('duration', 45))
     lyrics_text    = data.get('lyrics', '').strip()
     openai_key     = data.get('openai_key', '').strip()
+    song_title     = data.get('title', '').strip()
 
     if not pexels_url or not audio_url:
         return jsonify({'error': 'Missing pexels_url or audio_url'}), 400
 
-    print(f"[generate-short] key={api_key} dur={short_duration}s")
+    print(f"[generate-short] key={api_key} dur={short_duration}s title={song_title}")
 
     job_id     = api_key
     job_folder = os.path.join(UPLOAD_FOLDER, job_id)
@@ -527,17 +568,15 @@ def generate_short():
             for f in [video_path, audio_path, output_path]:
                 if os.path.exists(f): os.remove(f)
 
-            # Download video
             save_job(job_id, {'status': 'downloading_video'})
             download_pexels_video(pexels_url, video_path, pexels_api_key)
             print(f"[Job {job_id}] Video: {os.path.getsize(video_path)} bytes")
 
-            # Download audio
             save_job(job_id, {'status': 'downloading_audio'})
             download_file(audio_url, audio_path)
             print(f"[Job {job_id}] Audio: {os.path.getsize(audio_path)} bytes")
 
-            # ✅ Find best segment and trim
+            # ✅ Find best segment
             final_audio_path = audio_path
             try:
                 save_job(job_id, {'status': 'finding_best_segment'})
@@ -555,7 +594,7 @@ def generate_short():
                         os.path.exists(trimmed_audio) and
                         os.path.getsize(trimmed_audio) > 1000):
                     final_audio_path = trimmed_audio
-                    print(f"[Job {job_id}] Best segment: {best_start:.1f}s -> {best_start+short_duration:.1f}s")
+                    print(f"[Job {job_id}] Best: {best_start:.1f}s -> {best_start+short_duration:.1f}s")
                 else:
                     print(f"[Job {job_id}] Trim failed — using full audio")
             except Exception as trim_err:
@@ -591,7 +630,8 @@ def generate_short():
             generate_short_job(
                 job_id, video_path, final_audio_path, output_path,
                 lyrics_segments=lyrics_segments,
-                artist_name=artist_name
+                artist_name=artist_name,
+                song_title=song_title
             )
 
         except Exception as e:
@@ -657,9 +697,7 @@ def process_audio():
         return jsonify({'error': f'Download failed: {str(e)}'}), 500
 
     total_duration = get_audio_duration(audio_path)
-
-    # ✅ Find best segment automatically
-    best_start = find_best_segment(audio_path, segment_duration)
+    best_start     = find_best_segment(audio_path, segment_duration)
 
     seg_fn   = f'{session_id}_seg000.mp3'
     seg_path = os.path.join(AUDIO_SEGMENTS_FOLDER, seg_fn)
