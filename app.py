@@ -3,12 +3,10 @@ import subprocess
 import os
 import requests
 import threading
-import time
 import math
 import uuid
 import json
 import re
-import base64
 
 app = Flask(__name__)
 
@@ -126,6 +124,36 @@ def get_audio_duration(audio_path):
         try: return float(v)
         except: pass
     return 45.0
+
+def find_best_segment(audio_path, segment_duration=45):
+    """Find the loudest/most energetic segment in the audio."""
+    total_duration = get_audio_duration(audio_path)
+    if total_duration <= segment_duration:
+        return 0.0
+    step = 2.0
+    volumes = []
+    num_chunks = int(total_duration / step)
+    for i in range(num_chunks):
+        t = i * step
+        result = subprocess.run([
+            'ffmpeg', '-y', '-ss', str(t), '-t', str(step),
+            '-i', audio_path, '-af', 'volumedetect',
+            '-f', 'null', '/dev/null'
+        ], capture_output=True, text=True, timeout=10)
+        match = re.search(r'mean_volume:\s*([-\d.]+)\s*dB', result.stderr)
+        volumes.append(float(match.group(1)) if match else -60.0)
+    if not volumes:
+        return 0.0
+    window_chunks = int(segment_duration / step)
+    best_start = 0.0
+    best_score = -999.0
+    for i in range(len(volumes) - window_chunks + 1):
+        score = sum(volumes[i:i + window_chunks]) / window_chunks
+        if score > best_score:
+            best_score = score
+            best_start = i * step
+    print(f"[BestSegment] start={best_start:.1f}s score={best_score:.1f}dB total={total_duration:.1f}s")
+    return best_start
 
 # ─── Font Helpers ─────────────────────────────────────────────────────────────
 
@@ -494,37 +522,42 @@ def generate_short():
     save_job(job_id, {'status': 'pending', 'video_url': None})
 
     def run():
-        # ✅ Define final_audio_path at top so it's always accessible
         final_audio_path = None
         try:
             for f in [video_path, audio_path, output_path]:
                 if os.path.exists(f): os.remove(f)
 
+            # Download video
             save_job(job_id, {'status': 'downloading_video'})
             download_pexels_video(pexels_url, video_path, pexels_api_key)
             print(f"[Job {job_id}] Video: {os.path.getsize(video_path)} bytes")
 
+            # Download audio
             save_job(job_id, {'status': 'downloading_audio'})
             download_file(audio_url, audio_path)
             print(f"[Job {job_id}] Audio: {os.path.getsize(audio_path)} bytes")
 
-            # ✅ Trim audio to short_duration — always set final_audio_path
+            # ✅ Find best segment and trim
             final_audio_path = audio_path
             try:
-                trimmed_audio = os.path.join(job_folder, 'audio_trimmed.mp3')
+                save_job(job_id, {'status': 'finding_best_segment'})
+                best_start    = find_best_segment(audio_path, short_duration)
+                trimmed_audio = os.path.join(job_folder, 'audio_best.mp3')
                 proc_trim = subprocess.run([
-                    'ffmpeg', '-y', '-i', audio_path,
+                    'ffmpeg', '-y',
+                    '-ss', str(best_start),
+                    '-i', audio_path,
                     '-t', str(short_duration),
                     '-c:a', 'libmp3lame', '-b:a', '128k',
                     trimmed_audio
-                ], capture_output=True, timeout=60)
+                ], capture_output=True, timeout=120)
                 if (proc_trim.returncode == 0 and
                         os.path.exists(trimmed_audio) and
                         os.path.getsize(trimmed_audio) > 1000):
                     final_audio_path = trimmed_audio
-                    print(f"[Job {job_id}] Audio trimmed to {short_duration}s")
+                    print(f"[Job {job_id}] Best segment: {best_start:.1f}s -> {best_start+short_duration:.1f}s")
                 else:
-                    print(f"[Job {job_id}] Trim failed, using full audio")
+                    print(f"[Job {job_id}] Trim failed — using full audio")
             except Exception as trim_err:
                 print(f"[Trim] Failed: {trim_err} — using full audio")
 
@@ -624,22 +657,29 @@ def process_audio():
         return jsonify({'error': f'Download failed: {str(e)}'}), 500
 
     total_duration = get_audio_duration(audio_path)
-    segments = []; start = 0; idx = 0
-    while start < total_duration:
-        seg_fn   = f'{session_id}_seg{idx:03d}.mp3'
-        seg_path = os.path.join(AUDIO_SEGMENTS_FOLDER, seg_fn)
-        proc = subprocess.run(
-            ['ffmpeg', '-y', '-i', audio_path,
-             '-ss', str(start), '-t', str(segment_duration),
-             '-c:a', 'libmp3lame', '-b:a', '128k', seg_path],
-            capture_output=True, timeout=120
-        )
-        if proc.returncode == 0 and os.path.exists(seg_path):
-            segments.append(seg_fn)
-        start += segment_duration; idx += 1
+
+    # ✅ Find best segment automatically
+    best_start = find_best_segment(audio_path, segment_duration)
+
+    seg_fn   = f'{session_id}_seg000.mp3'
+    seg_path = os.path.join(AUDIO_SEGMENTS_FOLDER, seg_fn)
+
+    proc = subprocess.run([
+        'ffmpeg', '-y',
+        '-ss', str(best_start),
+        '-i', audio_path,
+        '-t', str(segment_duration),
+        '-c:a', 'libmp3lame', '-b:a', '128k',
+        seg_path
+    ], capture_output=True, timeout=120)
 
     os.remove(audio_path)
-    return jsonify({'segments': segments}), 200
+
+    if proc.returncode != 0 or not os.path.exists(seg_path):
+        return jsonify({'error': 'Segment extraction failed'}), 500
+
+    print(f"[ProcessAudio] Best: {best_start:.1f}s -> {best_start+segment_duration:.1f}s total={total_duration:.1f}s")
+    return jsonify({'segments': [seg_fn]}), 200
 
 
 @app.route('/audio_segments/<filename>', methods=['GET'])
