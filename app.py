@@ -6,13 +6,48 @@ import requests
 import threading
 import time
 import re
+import json
 
 app = Flask(__name__)
-jobs = {}
+
 UPLOAD_FOLDER = '/tmp/short_jobs'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 AUDIO_SEGMENTS_FOLDER = '/tmp/audio_segments'
 os.makedirs(AUDIO_SEGMENTS_FOLDER, exist_ok=True)
+JOBS_STATE_FILE = '/tmp/jobs_state.json'
+
+# ─── Job Persistence (file-based, survives restarts) ─────────────────────────
+
+def load_jobs():
+    try:
+        if os.path.exists(JOBS_STATE_FILE):
+            with open(JOBS_STATE_FILE, 'r') as f:
+                return json.load(f)
+    except:
+        pass
+    return {}
+
+def save_job(job_id, data):
+    jobs = load_jobs()
+    jobs[job_id] = data
+    try:
+        with open(JOBS_STATE_FILE, 'w') as f:
+            json.dump(jobs, f)
+    except:
+        pass
+
+def get_job(job_id):
+    jobs = load_jobs()
+    return jobs.get(job_id)
+
+def delete_job(job_id):
+    jobs = load_jobs()
+    jobs.pop(job_id, None)
+    try:
+        with open(JOBS_STATE_FILE, 'w') as f:
+            json.dump(jobs, f)
+    except:
+        pass
 
 # ─── Font Helpers ─────────────────────────────────────────────────────────────
 
@@ -40,30 +75,18 @@ def get_italic_font():
 # ─── Download Helpers ─────────────────────────────────────────────────────────
 
 def download_file(url, dest_path):
-    headers = {'Cache-Control': 'no-cache', 'Pragma': 'no-cache'}
     try:
-        r = requests.get(
-            f"{url}?nocache={int(time.time())}",
-            timeout=180, stream=True, headers=headers
-        )
-        if r.status_code != 200:
-            r = requests.get(url, timeout=180, stream=True)
-        r.raise_for_status()
-    except Exception:
         r = requests.get(url, timeout=180, stream=True)
         r.raise_for_status()
-    with open(dest_path, 'wb') as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
-    return dest_path
+        with open(dest_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        return dest_path
+    except Exception as e:
+        raise Exception(f"Download failed for {url}: {e}")
 
 def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
-    """
-    Accepts:
-      - A direct video CDN URL (already resolved by WordPress plugin)
-      - A Pexels page URL (https://www.pexels.com/video/xxx-NNNNNN/)
-    """
-    # Already a direct video link (CDN or .mp4)
+    # Already a direct CDN video link
     if '.mp4' in pexels_url.lower() or 'videos/download' in pexels_url:
         return download_file(pexels_url, dest_path)
 
@@ -76,7 +99,6 @@ def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
     if not match:
         match = re.search(r'(\d{5,})/?$', pexels_url)
     if not match:
-        # Just try to download as-is
         return download_file(pexels_url, dest_path)
 
     video_id = match.group(1)
@@ -92,7 +114,6 @@ def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
         if api_resp.status_code == 200:
             data  = api_resp.json()
             files = data.get('video_files', [])
-            # Pick best quality <= 720p
             selected = None
             max_h    = 0
             for f in files:
@@ -100,22 +121,19 @@ def download_pexels_video(pexels_url, dest_path, pexels_api_key=""):
                 if h <= 720 and h > max_h:
                     max_h    = h
                     selected = f['link']
-            # Fallback SD
             if not selected:
                 for f in files:
                     if f.get('quality') == 'sd':
                         selected = f['link']
                         break
-            # Fallback first
             if not selected and files:
                 selected = files[0]['link']
             if selected:
-                print(f"[Pexels] Using video: {selected}")
+                print(f"[Pexels] Downloading: {selected[:80]}")
                 return download_file(selected, dest_path)
     except Exception as e:
         print(f"[Pexels API] Error: {e}")
 
-    # Last fallback
     fallback_url = f"https://www.pexels.com/video/{video_id}/download/"
     return download_file(fallback_url, dest_path)
 
@@ -149,7 +167,7 @@ def get_video_info(video_path):
                 try: duration = float(v)
                 except: pass
 
-    # Second attempt with format-level probe
+    # Second attempt
     if duration is None:
         result2 = subprocess.run(
             ['ffprobe', '-v', 'error',
@@ -167,7 +185,6 @@ def get_video_info(video_path):
     return duration or 30.0, width or 1080, height or 1920
 
 def get_audio_duration(audio_path):
-    """Returns audio duration in seconds — safe against empty output."""
     result = subprocess.run(
         ['ffprobe', '-v', 'error',
          '-show_entries', 'format=duration',
@@ -177,11 +194,9 @@ def get_audio_duration(audio_path):
     )
     v = result.stdout.strip()
     if v and v != 'N/A':
-        try:
-            return float(v)
-        except:
-            pass
-    return 60.0  # safe default
+        try: return float(v)
+        except: pass
+    return 60.0
 
 # ─── FFmpeg Escape ────────────────────────────────────────────────────────────
 
@@ -254,13 +269,14 @@ def build_short_video(video_path, audio_path, output_path,
         '-map', '0:v:0',
         '-map', '1:a:0',
         '-c:v', 'libx264',
-        '-preset', 'fast',
-        '-crf', '23',
+        '-preset', 'ultrafast',  # faster = less memory
+        '-crf', '28',            # slightly lower quality = less memory
         '-c:a', 'aac',
-        '-b:a', '192k',
+        '-b:a', '128k',
         '-pix_fmt', 'yuv420p',
         '-t', str(final_duration),
         '-shortest',
+        '-threads', '1',         # limit threads to save memory
         output_path
     ]
     return cmd, final_duration
@@ -268,26 +284,31 @@ def build_short_video(video_path, audio_path, output_path,
 def generate_short_job(job_id, video_path, audio_path, output_path,
                        short_duration=60, artist_name="SORLUNE"):
     try:
-        jobs[job_id]['status'] = 'processing'
+        save_job(job_id, {'status': 'processing', 'video_url': None})
+
         cmd, final_duration = build_short_video(
             video_path, audio_path, output_path,
             short_duration=short_duration,
             artist_name=artist_name
         )
-        jobs[job_id]['duration'] = round(final_duration, 1)
-        print(f"[FFmpeg] Starting for job {job_id}...")
+
+        print(f"[FFmpeg] Starting job {job_id}...")
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
         if proc.returncode == 0 and os.path.exists(output_path):
-            jobs[job_id]['status']    = 'completed'
-            jobs[job_id]['video_url'] = f"/videos/{job_id}/{job_id}.mp4"
+            save_job(job_id, {
+                'status': 'completed',
+                'video_url': f"/videos/{job_id}/{job_id}.mp4",
+                'duration': round(final_duration, 1)
+            })
             print(f"[Job {job_id}] ✅ Done!")
         else:
-            jobs[job_id]['status'] = 'error'
-            jobs[job_id]['error']  = proc.stderr[-3000:]
-            print(f"[FFmpeg ERROR]\n{proc.stderr[-3000:]}")
+            error_msg = proc.stderr[-2000:] if proc.stderr else 'Unknown error'
+            save_job(job_id, {'status': 'error', 'error': error_msg})
+            print(f"[FFmpeg ERROR] {error_msg}")
+
     except Exception as e:
-        jobs[job_id]['status'] = 'error'
-        jobs[job_id]['error']  = str(e)
+        save_job(job_id, {'status': 'error', 'error': str(e)})
         print(f"[Job {job_id}] ❌ {e}")
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -308,7 +329,7 @@ def generate_short():
     if not pexels_url or not audio_url:
         return jsonify({'error': 'Missing pexels_url or audio_url'}), 400
 
-    print(f"[generate-short] key={api_key} pexels={pexels_url[:60]}")
+    print(f"[generate-short] key={api_key}")
 
     job_id     = api_key
     job_folder = os.path.join(UPLOAD_FOLDER, job_id)
@@ -318,7 +339,7 @@ def generate_short():
     audio_path  = os.path.join(job_folder, 'audio.mp3')
     output_path = os.path.join(job_folder, f'{job_id}.mp4')
 
-    jobs[job_id] = {'status': 'pending', 'video_url': None}
+    save_job(job_id, {'status': 'pending', 'video_url': None})
 
     def run():
         try:
@@ -326,12 +347,12 @@ def generate_short():
                 if os.path.exists(f):
                     os.remove(f)
 
-            jobs[job_id]['status'] = 'downloading_video'
+            save_job(job_id, {'status': 'downloading_video'})
             print(f"[Job {job_id}] Downloading video...")
             download_pexels_video(pexels_url, video_path, pexels_api_key)
             print(f"[Job {job_id}] Video: {os.path.getsize(video_path)} bytes")
 
-            jobs[job_id]['status'] = 'downloading_audio'
+            save_job(job_id, {'status': 'downloading_audio'})
             print(f"[Job {job_id}] Downloading audio...")
             download_file(audio_url, audio_path)
             print(f"[Job {job_id}] Audio: {os.path.getsize(audio_path)} bytes")
@@ -342,8 +363,7 @@ def generate_short():
                 artist_name=artist_name
             )
         except Exception as e:
-            jobs[job_id]['status'] = 'error'
-            jobs[job_id]['error']  = str(e)
+            save_job(job_id, {'status': 'error', 'error': str(e)})
             print(f"[Job {job_id}] ❌ {e}")
 
     threading.Thread(target=run, daemon=True).start()
@@ -352,7 +372,7 @@ def generate_short():
 
 @app.route('/status/<api_key>', methods=['GET'])
 def check_status(api_key):
-    job = jobs.get(api_key)
+    job = get_job(api_key)
     if not job:
         return jsonify({'status': 'not_found'}), 200
     response = {'status': job['status']}
@@ -377,7 +397,7 @@ def clear_cache():
     data    = request.get_json()
     api_key = data.get('api_key') if data else None
     if api_key:
-        jobs.pop(api_key, None)
+        delete_job(api_key)
         import shutil
         job_folder = os.path.join(UPLOAD_FOLDER, api_key)
         if os.path.exists(job_folder):
@@ -413,7 +433,7 @@ def process_audio():
         proc = subprocess.run(
             ['ffmpeg', '-y', '-i', audio_path,
              '-ss', str(start), '-t', str(segment_duration),
-             '-c:a', 'libmp3lame', '-b:a', '192k', seg_path],
+             '-c:a', 'libmp3lame', '-b:a', '128k', seg_path],
             capture_output=True, timeout=120
         )
         if proc.returncode == 0 and os.path.exists(seg_path):
