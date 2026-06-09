@@ -427,12 +427,77 @@ def build_karaoke_filter(segments, font, lyrics_font=None):
                 )
     return ",".join(parts)
 
-# ─── Core FFmpeg ──────────────────────────────────────────────────────────────
+# ─── Core FFmpeg — IMAGE MODE (loops image + audio) ───────────────────────────
+
+def build_ffmpeg_command_image(image_path, audio_path, output_path, audio_duration,
+                                font, font_italic, lyrics_font=None,
+                                lyrics_segments=None, artist_name="SORLUNE",
+                                song_title=""):
+    """Build FFmpeg command using static image looped with audio — for shorts"""
+    fade_out_st  = max(audio_duration - 3, audio_duration * 0.85)
+
+    # Scale image to 720x1280 vertical 9:16
+    scale_crop = (
+        "scale=720:1280:force_original_aspect_ratio=increase,"
+        "crop=720:1280"
+    )
+    # Subtle zoom effect on image
+    zoom_filter = "zoompan=z='min(zoom+0.0005,1.05)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=720x1280:fps=25"
+
+    grade_filter = (
+        "eq=brightness=-0.02:contrast=1.05:saturation=0.95,"
+        "curves=r='0/0 0.5/0.45 1/0.9':g='0/0 0.5/0.42 1/0.85':b='0/0 0.5/0.50 1/1.0'"
+    )
+    dark_overlay = (
+        f"drawtext=fontfile={font}:text=' ':fontsize=1:fontcolor=black@0:"
+        f"box=1:boxcolor=black@0.45:boxborderw=0:"
+        f"x=0:y=h*{DARK_START}:fix_bounds=1"
+    )
+    fade_filter   = f"fade=t=in:st=0:d=2,fade=t=out:st={fade_out_st:.2f}:d=3"
+    artist_filter = build_artist_watermark(font_italic, artist_name)
+    cta_filter    = build_subscribe_cta(font)
+    eq_filter     = build_eq_bar(font)
+
+    vf_parts = [scale_crop, zoom_filter, grade_filter, "format=yuv420p", dark_overlay, artist_filter]
+
+    title_filter = build_song_title(font, song_title)
+    if title_filter:
+        vf_parts.append(title_filter)
+
+    if lyrics_segments:
+        karaoke = build_karaoke_filter(lyrics_segments, font, lyrics_font=lyrics_font)
+        if karaoke:
+            vf_parts.append(karaoke)
+
+    vf_parts.append(cta_filter)
+    vf_parts.append(eq_filter)
+    vf_parts.append(fade_filter)
+
+    return [
+        'ffmpeg', '-y',
+        '-loop', '1',              # ✅ Loop image
+        '-i', image_path,          # ✅ Input 0: image
+        '-i', audio_path,          # ✅ Input 1: audio
+        '-vf', ",".join(vf_parts),
+        '-map', '0:v:0',           # ✅ video from image
+        '-map', '1:a:0',           # ✅ audio from song
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26',
+        '-tune', 'stillimage',     # ✅ optimize for still image input
+        '-threads', '2',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-pix_fmt', 'yuv420p',
+        '-t', str(audio_duration),
+        '-shortest',
+        output_path
+    ]
+
+# ─── Core FFmpeg — VIDEO MODE (loops video + audio) ───────────────────────────
 
 def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_duration,
                                 font, font_italic, lyrics_font=None,
                                 lyrics_segments=None, artist_name="SORLUNE",
                                 song_title=""):
+    """Build FFmpeg command using Pexels video — kept for manual short bot"""
     fade_out_st  = max(audio_duration - 3, audio_duration * 0.85)
     scale_crop   = (
         "scale=720:1280:force_original_aspect_ratio=increase,"
@@ -454,12 +519,10 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
 
     vf_parts = [scale_crop, grade_filter, "format=yuv420p", dark_overlay, artist_filter]
 
-    # Song title at top
     title_filter = build_song_title(font, song_title)
     if title_filter:
         vf_parts.append(title_filter)
 
-    # Karaoke lyrics
     if lyrics_segments:
         karaoke = build_karaoke_filter(lyrics_segments, font, lyrics_font=lyrics_font)
         if karaoke:
@@ -475,8 +538,8 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
         '-i', video_path,
         '-i', audio_path,
         '-vf', ",".join(vf_parts),
-        '-map', '0:v:0',          # ✅ video from pexels
-        '-map', '1:a:0',          # ✅ audio from song
+        '-map', '0:v:0',
+        '-map', '1:a:0',
         '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26',
         '-threads', '1',
         '-c:a', 'aac', '-b:a', '128k',
@@ -486,8 +549,9 @@ def build_ffmpeg_command_short(video_path, audio_path, output_path, audio_durati
         output_path
     ]
 
-def generate_short_job(job_id, video_path, audio_path, output_path,
-                       lyrics_segments=None, artist_name="SORLUNE", song_title=""):
+def generate_short_job(job_id, media_path, audio_path, output_path,
+                       is_image=False, lyrics_segments=None,
+                       artist_name="SORLUNE", song_title=""):
     try:
         save_job(job_id, {'status': 'processing'})
         audio_duration = get_audio_duration(audio_path)
@@ -495,16 +559,26 @@ def generate_short_job(job_id, video_path, audio_path, output_path,
         font_italic    = get_italic_font()
         lyrics_font    = get_lyrics_font()
 
-        cmd = build_ffmpeg_command_short(
-            video_path, audio_path, output_path,
-            audio_duration, font, font_italic,
-            lyrics_font=lyrics_font,
-            lyrics_segments=lyrics_segments,
-            artist_name=artist_name,
-            song_title=song_title
-        )
+        if is_image:
+            cmd = build_ffmpeg_command_image(
+                media_path, audio_path, output_path,
+                audio_duration, font, font_italic,
+                lyrics_font=lyrics_font,
+                lyrics_segments=lyrics_segments,
+                artist_name=artist_name,
+                song_title=song_title
+            )
+        else:
+            cmd = build_ffmpeg_command_short(
+                media_path, audio_path, output_path,
+                audio_duration, font, font_italic,
+                lyrics_font=lyrics_font,
+                lyrics_segments=lyrics_segments,
+                artist_name=artist_name,
+                song_title=song_title
+            )
 
-        print(f"[FFmpeg] Starting job {job_id}...")
+        print(f"[FFmpeg] Starting job {job_id} (image={is_image})...")
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
 
         if proc.returncode == 0 and os.path.exists(output_path):
@@ -531,7 +605,9 @@ def generate_short():
     if not data:
         return jsonify({'error': 'No JSON data'}), 400
 
-    pexels_url     = data.get('pexels_url')
+    # ✅ Support both image_url (new) and pexels_url (legacy)
+    image_url      = data.get('image_url', '').strip()
+    pexels_url     = data.get('pexels_url', '').strip()
     audio_url      = data.get('audio_url')
     api_key        = data.get('api_key', str(uuid.uuid4())[:8])
     pexels_api_key = data.get('pexels_api_key', '').strip()
@@ -541,16 +617,18 @@ def generate_short():
     openai_key     = data.get('openai_key', '').strip()
     song_title     = data.get('title', '').strip()
 
-    if not pexels_url or not audio_url:
-        return jsonify({'error': 'Missing pexels_url or audio_url'}), 400
+    # Must have either image_url or pexels_url
+    if not audio_url or (not image_url and not pexels_url):
+        return jsonify({'error': 'Missing audio_url and image_url or pexels_url'}), 400
 
-    print(f"[generate-short] key={api_key} dur={short_duration}s title={song_title}")
+    use_image = bool(image_url)
+    print(f"[generate-short] key={api_key} mode={'IMAGE' if use_image else 'VIDEO'} title={song_title}")
 
     job_id     = api_key
     job_folder = os.path.join(UPLOAD_FOLDER, job_id)
     os.makedirs(job_folder, exist_ok=True)
 
-    video_path  = os.path.join(job_folder, 'pexels_video.mp4')
+    media_path  = os.path.join(job_folder, 'image.jpg' if use_image else 'pexels_video.mp4')
     audio_path  = os.path.join(job_folder, 'audio.mp3')
     output_path = os.path.join(job_folder, f'{job_id}.mp4')
 
@@ -559,18 +637,24 @@ def generate_short():
     def run():
         final_audio_path = None
         try:
-            for f in [video_path, audio_path, output_path]:
+            for f in [media_path, audio_path, output_path]:
                 if os.path.exists(f): os.remove(f)
 
-            save_job(job_id, {'status': 'downloading_video'})
-            download_pexels_video(pexels_url, video_path, pexels_api_key)
-            print(f"[Job {job_id}] Video: {os.path.getsize(video_path)} bytes")
+            # Download media (image or video)
+            if use_image:
+                save_job(job_id, {'status': 'downloading_image'})
+                download_file(image_url, media_path)
+                print(f"[Job {job_id}] Image: {os.path.getsize(media_path)} bytes")
+            else:
+                save_job(job_id, {'status': 'downloading_video'})
+                download_pexels_video(pexels_url, media_path, pexels_api_key)
+                print(f"[Job {job_id}] Video: {os.path.getsize(media_path)} bytes")
 
             save_job(job_id, {'status': 'downloading_audio'})
             download_file(audio_url, audio_path)
             print(f"[Job {job_id}] Audio: {os.path.getsize(audio_path)} bytes")
 
-            # ✅ Find best segment
+            # Find best segment
             final_audio_path = audio_path
             try:
                 save_job(job_id, {'status': 'finding_best_segment'})
@@ -588,13 +672,13 @@ def generate_short():
                         os.path.exists(trimmed_audio) and
                         os.path.getsize(trimmed_audio) > 1000):
                     final_audio_path = trimmed_audio
-                    print(f"[Job {job_id}] Best: {best_start:.1f}s -> {best_start+short_duration:.1f}s")
+                    print(f"[Job {job_id}] Best: {best_start:.1f}s")
                 else:
                     print(f"[Job {job_id}] Trim failed — using full audio")
             except Exception as trim_err:
-                print(f"[Trim] Failed: {trim_err} — using full audio")
+                print(f"[Trim] Failed: {trim_err}")
 
-            # ✅ Lyrics via Whisper
+            # Lyrics via Whisper
             lyrics_segments = []
             if openai_key:
                 try:
@@ -606,7 +690,7 @@ def generate_short():
                 except Exception as e:
                     print(f"[Lyrics] Whisper failed: {e}")
 
-            # ✅ Fallback: time-based lyrics
+            # Fallback time-based lyrics
             if not lyrics_segments and lyrics_text:
                 duration = get_audio_duration(final_audio_path)
                 lines    = split_lyrics_lines(lyrics_text)
@@ -622,7 +706,8 @@ def generate_short():
                         current += step
 
             generate_short_job(
-                job_id, video_path, final_audio_path, output_path,
+                job_id, media_path, final_audio_path, output_path,
+                is_image=use_image,
                 lyrics_segments=lyrics_segments,
                 artist_name=artist_name,
                 song_title=song_title
@@ -721,7 +806,7 @@ def serve_audio_segment(filename):
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok', 'message': 'My Short server running'}), 200
+    return jsonify({'status': 'ok', 'message': 'My Short server running — Image + Video modes'}), 200
 
 
 if __name__ == '__main__':
